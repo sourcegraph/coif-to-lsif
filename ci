@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+set -ex
+
+yarn -s --frozen-lockfile
+yarn run prettier '**/*.{json,ts,md}' --list-different
+./build
+yarn run jest

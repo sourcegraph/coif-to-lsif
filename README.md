@@ -1,0 +1,1 @@
+Converts from https://github.com/rvantonder/merlin to LSIF format.

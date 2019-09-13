@@ -1,0 +1,1 @@
+int five(int x);
