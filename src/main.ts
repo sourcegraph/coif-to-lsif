@@ -1,6 +1,8 @@
-import { index } from './index'
 import yargs from 'yargs'
 import * as fs from 'fs'
+import * as sourceMapSupport from 'source-map-support'
+import { writeLSIF } from './lsif'
+sourceMapSupport.install()
 
 // Causes node to print all stacks from nested VErrors.
 process.on('uncaughtException', error => {
@@ -12,11 +14,11 @@ process.on('uncaughtException', error => {
 main()
 
 async function main() {
-    const { csvFileGlob, root, out } = yargs
-        .demandOption('csvFileGlob')
+    const { inFileGlob, root, out } = yargs
+        .demandOption('inFileGlob')
         .demandOption('out')
         .demandOption('root').argv as {
-        csvFileGlob: string
+        inFileGlob: string
         root: string
         out: string
     }
@@ -28,8 +30,8 @@ async function main() {
     }
 
     try {
-        await index({
-            csvFileGlob,
+        await writeLSIF({
+            inFileGlob,
             root,
             emit: item =>
                 new Promise(resolve => {

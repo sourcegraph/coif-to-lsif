@@ -1,31 +1,15 @@
-import { index } from './index'
+import { writeLSIF } from './lsif'
 import { Edge, Vertex } from 'lsif-protocol'
 import _ from 'lodash'
-import * as path from 'path'
-import * as cp from 'child_process'
-
-const GENERATE = false
-
-function generate(example: string): void {
-    cp.execFileSync('./generate-csv', ['$CXX -c *.cpp'], {
-        env: {
-            ABSROOTDIR: path.resolve(`examples/${example}/root`),
-            ABSOUTDIR: path.resolve(`examples/${example}/output`),
-            CLEAN: 'true',
-        },
-    })
-}
 
 async function indexExample(example: string): Promise<(Edge | Vertex)[]> {
-    if (GENERATE) {
-        generate(example)
-    }
-
     const output: (Edge | Vertex)[] = []
 
-    await index({
-        csvFileGlob: `examples/${example}/output/*.csv`,
-        root: `examples/${example}/root`,
+    await writeLSIF({
+        inFileGlob: `examples/${example}/*.lsif.in`,
+        root: `examples/${example}`,
+        // inFileGlob: `/Users/chrismwendt/github.com/comby-tools/comby/**/*.lsif.in`,
+        // root: `/Users/chrismwendt/github.com/comby-tools/comby`,
         emit: item =>
             new Promise(resolve => {
                 output.push(item)
@@ -37,7 +21,7 @@ async function indexExample(example: string): Promise<(Edge | Vertex)[]> {
 }
 
 test('does not emit items with duplicate IDs', async () => {
-    const output = await indexExample('five')
+    const output = await indexExample('one')
 
     const setsOfDupes = _(output)
         .groupBy(item => item.id)
@@ -61,18 +45,7 @@ test('does not emit items with duplicate IDs', async () => {
     }
 })
 
-test('five', async () => {
-    const output = (await indexExample('five')).map(v => JSON.stringify(v))
-
+test.only('one', async () => {
+    const output = (await indexExample('one')).map(v => JSON.stringify(v))
     expect(output.join('\n')).toMatchSnapshot()
-})
-
-test('cross-app', async () => {
-    const app = (await indexExample('cross-app')).map(v => JSON.stringify(v))
-    expect(app.join('\n')).toMatchSnapshot()
-})
-
-test('cross-lib', async () => {
-    const lib = (await indexExample('cross-lib')).map(v => JSON.stringify(v))
-    expect(lib.join('\n')).toMatchSnapshot()
 })

@@ -3,6 +3,7 @@
   "license": "MIT",
   "devDependencies": {
     "@sourcegraph/prettierrc": "^3.0.1",
+    "@types/better-sqlite3": "^5.4.0",
     "@types/glob": "^7.1.1",
     "@types/jest": "^24.0.18",
     "@types/lodash": "^4.14.137",
@@ -19,6 +20,7 @@
     "typescript": "^3.6.2"
   },
   "dependencies": {
+    "better-sqlite3": "^5.4.3",
     "glob": "^7.1.4",
     "lodash": "^4.17.15",
     "lsif-protocol": "^0.4.3",

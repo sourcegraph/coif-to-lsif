@@ -1,10 +1,6 @@
-import * as readline from 'readline'
-import * as fs from 'fs'
-import * as util from 'util'
 import * as path from 'path'
-import { VError } from 'verror'
-import * as sourceMapSupport from 'source-map-support'
-sourceMapSupport.install()
+import * as util from 'util'
+import * as fs from 'fs'
 import {
     fromPairs,
     chunk,
@@ -50,10 +46,12 @@ import {
     MonikerKind,
     moniker,
     packageInformation,
+    textDocument_hover,
 } from 'lsif-protocol'
 import * as lsp from 'vscode-languageserver-protocol'
 import * as P from 'parsimmon'
 import glob from 'glob'
+import Database from 'better-sqlite3'
 
 // What are all of the kinds? According to DXR source code:
 //
@@ -65,103 +63,238 @@ import glob from 'glob'
 
 type Emit = <T extends Edge | Vertex>(item: T) => Promise<void>
 
-export async function index({
-    csvFileGlob,
+// {
+//   "start": {
+//     "line": 99,
+//     "col": 62
+//   },
+//   "end": {
+//     "line": 99,
+//     "col": 68
+//   },
+//   "definition": {
+//     "file": "*buffer*",
+//     "pos": {
+//       "line": 57,
+//       "col": 4
+//     }
+//   },
+//   "type": "[< `Path of string | `String of string ]"
+// }
+//
+// file,start,end,deffile,defstart,type?
+// docs = SELECT DISTINCT file
+// rangesByDoc = SELECT start,end GROUP BY file
+
+type Doc_ = string
+type Range_ = string
+type Ref_ = Range_
+type Def_ = Range_
+
+export async function writeLSIF({
+    inFileGlob,
     root,
     emit,
 }: {
-    csvFileGlob: string
+    inFileGlob: string
     root: string
     emit: Emit
 }): Promise<void> {
-    await emit(makeMeta(root, csvFileGlob))
-    await emit(makeProject())
-    await emit(makeProjectBegin())
-
-    const docs = new Set<string>()
-    const rangesByDoc = new Map<string, Set<string>>()
-    const refsByDef = new Map<string, Set<string>>()
-    const locByRange = new Map<string, lsp.Location>()
+    const docs = new Set<Doc_>()
+    const rangesByDoc = new Map<Doc_, Set<Range_>>()
+    const hoverByDef = new Map<Def_, string>()
+    const refsByDef = new Map<Def_, Set<Ref_>>()
+    const locByRange = new Map<Range_, lsp.Location>()
     const importMonikerByRange = new Map<
-        string,
+        Range_,
         { moniker: string; packageInformation: string }
     >()
     const exportMonikerByRange = new Map<
-        string,
+        Range_,
         { moniker: string; packageInformation: string }
     >()
 
-    function onDoc(doc: string): void {
-        if (!docs.has(doc)) {
-            docs.add(doc)
-        }
-
-        if (!rangesByDoc.has(doc)) {
-            rangesByDoc.set(doc, new Set())
-        }
+    const inFiles = glob.sync(inFileGlob)
+    if (inFiles.length === 0) {
+        throw new Error(`glob ${inFileGlob} did not match any files`)
     }
 
-    function onLoc(loc: lsp.Location): void {
-        onDoc(loc.uri)
-        const ranges = rangesByDoc.get(loc.uri)
-        if (!ranges) {
-            throw new Error(`rangesByDoc does not contain ${loc.uri}`)
-        }
-        if (!ranges.has(stringifyLocation(loc))) {
-            ranges.add(stringifyLocation(loc))
-        }
-        locByRange.set(stringifyLocation(loc), loc)
+    try {
+        fs.unlinkSync('data.sqlite')
+    } catch (e) {
+        // yolo
+    }
+    const db = new Database('data.sqlite')
+    db.exec(`DROP TABLE IF EXISTS lines`)
+    db.exec(`CREATE TABLE lines (
+            file TEXT NOT NULL,
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            deffile TEXT NOT NULL,
+            defstart TEXT NOT NULL,
+            type TEXT NOT NULL,
+            UNIQUE (file, start, end)
+        )`)
+
+    for (const inFile of inFiles) {
+        const insert = db.prepare(
+            'INSERT OR REPLACE INTO lines (file, start, end, deffile, defstart, type) VALUES (@file, @start, @end, @deffile, @defstart, @type)'
+        )
+
+        const insertMany = db.transaction(lines => {
+            for (const line of lines) insert.run(line)
+        })
+
+        const sourceFile = inFile
+            .slice(root.length + 1 /* for the slash */)
+            .replace(/.lsif.in$/, '')
+
+        insertMany(
+            fs
+                .readFileSync(inFile)
+                .toString()
+                .trimRight()
+                .split('\n')
+                .map(line => JSON.parse(line))
+                .filter(line => 'start' in line)
+                .map(line => {
+                    try {
+                        line.start.line = line.start.line - 1
+                        line.end.line = line.end.line - 1
+                        line.definition.pos.line = line.definition.pos.line - 1
+                        line.definition.file =
+                            line.definition.file === '*buffer*'
+                                ? sourceFile
+                                : line.definition.file
+                        return line
+                    } catch (e) {
+                        console.log('Error on line', line)
+                        throw e
+                    }
+                })
+                .filter(line => !line.definition.file.startsWith('/'))
+                .map(line => ({
+                    file: sourceFile,
+                    start: stringifyPosition(line.start),
+                    end: stringifyPosition(line.end),
+                    deffile: line.definition.file,
+                    defstart: stringifyPosition(line.definition.pos),
+                    type: (line.type || '<unknown>').slice(0, 200),
+                }))
+        )
     }
 
-    function link({
-        def,
-        ref,
-    }: {
-        def: lsp.Location
-        ref: lsp.Location
-    }): void {
-        onLoc(def)
-        onLoc(ref)
+    // db.exec(`DROP TABLE IF EXISTS lines`)
 
-        let refs = refsByDef.get(stringifyLocation(def))
-        if (!refs) {
-            refs = new Set()
-            refsByDef.set(stringifyLocation(def), refs)
-        }
-        refs.add(stringifyLocation(ref))
+    // db.exec(`CREATE TABLE symbols (
+    //     deffile TEXT NOT NULL,
+    //     defstart TEXT NOT NULL,
+    //     type TEXT NOT NULL
+    // )`)
+    // db.exec(
+    //     'INSERT INTO symbols (deffile, defstart, type) SELECT deffile, defstart, type FROM lines'
+    // )
+
+    // db.exec(`
+    //     BEGIN TRANSACTION;
+    //     CREATE TEMPORARY TABLE t1_backup(a,b);
+    //     INSERT INTO t1_backup SELECT a,b FROM t1;
+    //     DROP TABLE t1;
+    //     CREATE TABLE t1(a,b);
+    //     INSERT INTO t1 SELECT a,b FROM t1_backup;
+    //     DROP TABLE t1_backup;
+    //     COMMIT;
+    // `)
+
+    for (const hmm of db
+        .prepare(
+            'SELECT DISTINCT file, start, end from lines UNION ALL SELECT DISTINCT deffile, defstart, defstart from lines'
+        )
+        .all()) {
+        docs.add(hmm.file)
+        rangesByDoc.set(hmm.file, rangesByDoc.get(hmm.file) || new Set())
+        const ranges = rangesByDoc.get(hmm.file)!
+        const start = stringifyStringLocation({
+            uri: hmm.file,
+            range: { start: hmm.start },
+        })
+        ranges.add(start)
+        locByRange.set(
+            start,
+            parseLocation(`${hmm.file}:${hmm.start}`, `${hmm.file}:${hmm.end}`)
+        )
     }
 
-    function recordMoniker({
-        moniker,
-        range,
-        kind,
-        packageInformation,
-    }: {
-        moniker: string
-        range: string
-        kind: MonikerKind
-        packageInformation: string
-    }): void {
-        switch (kind) {
-            case MonikerKind.import:
-                importMonikerByRange.set(range, { moniker, packageInformation })
-                break
-            case MonikerKind.export:
-                exportMonikerByRange.set(range, { moniker, packageInformation })
-                break
-            default:
-                console.log('unimplemented kind', kind)
-        }
+    for (const hmm of db
+        .prepare(
+            'SELECT DISTINCT file, start, deffile, defstart, type from lines'
+        )
+        .all()) {
+        const therefstart = stringifyStringLocation({
+            uri: hmm.file,
+            range: { start: hmm.start },
+        })
+        const thedefstart = stringifyStringLocation({
+            uri: hmm.deffile,
+            range: { start: hmm.defstart },
+        })
+        refsByDef.set(thedefstart, refsByDef.get(thedefstart) || new Set())
+        const refs = refsByDef.get(thedefstart)!
+        refs.add(therefstart)
+
+        hoverByDef.set(thedefstart, hmm.type)
     }
 
-    const dp = mkDispatch({ link, recordMoniker })
-    const csvFiles = glob.sync(csvFileGlob)
-    if (csvFiles.length === 0) {
-        throw new Error(`glob ${csvFileGlob} did not match any files`)
-    }
-    for (const csvFile of csvFiles) {
-        await scanCsvFile({ csvFile, cb: dp })
-    }
+    // refsByDef def keys ranges
+    // locByRange
+
+    await ffff({
+        emit,
+        root,
+        inFileGlob,
+        docs,
+        rangesByDoc,
+        refsByDef,
+        hoverByDef,
+        locByRange,
+        importMonikerByRange,
+        exportMonikerByRange,
+    })
+}
+
+async function ffff({
+    emit,
+    root,
+    inFileGlob,
+    docs,
+    rangesByDoc,
+    refsByDef,
+    hoverByDef,
+    locByRange,
+    importMonikerByRange,
+    exportMonikerByRange,
+}: {
+    emit: Emit
+    root: string
+    inFileGlob: string
+
+    docs: Set<Doc_>
+    rangesByDoc: Map<Doc_, Set<Range_>>
+    refsByDef: Map<Def_, Set<Ref_>>
+    hoverByDef: Map<Def_, string>
+    locByRange: Map<Range_, lsp.Location>
+    importMonikerByRange: Map<
+        Range_,
+        { moniker: string; packageInformation: string }
+    >
+    exportMonikerByRange: Map<
+        Range_,
+        { moniker: string; packageInformation: string }
+    >
+}): Promise<void> {
+    await emit(makeMeta(root, inFileGlob))
+    await emit(makeProject())
+    await emit(makeProjectBegin())
 
     for (const doc of Array.from(docs)) {
         await emitDocsBegin({ root, doc, emit })
@@ -179,10 +312,9 @@ export async function index({
         await emit(makeRange(loc))
     }
 
-    followTransitiveDefsDepth1(refsByDef)
-
-    await emitDefsRefs({
+    await emitDefsRefsHovers({
         refsByDef,
+        hoverByDef,
         locByRange,
         emit,
         importMonikerByRange,
@@ -206,6 +338,31 @@ function stringifyLocation(loc: lsp.Location): string {
     return `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}`
 }
 
+function stringifyStringLocation(loc: {
+    uri: string
+    range: { start: string }
+}): string {
+    return `${loc.uri}:${loc.range.start}`
+}
+
+interface Pos_ {
+    line: number
+    col: number
+}
+
+interface ImportRange {
+    start: Pos_
+    end: Pos_
+}
+
+function stringifyRange(range: ImportRange): string {
+    return `${range.start.line}:${range.start.col}-${range.end.line}:${range.end.col}`
+}
+
+function stringifyPosition(pos: Pos_): string {
+    return `${pos.line}:${pos.col}`
+}
+
 interface FilePosition {
     uri: string
     position: lsp.Position
@@ -222,125 +379,6 @@ type RecordMoniker = (arg: {
     packageInformation: string
 }) => void
 
-async function scanCsvFile({
-    csvFile,
-    cb,
-}: {
-    csvFile: string
-    cb: (genericEntry: GenericEntry) => void
-}) {
-    let chunk = ''
-    await forEachLine({
-        filePath: csvFile,
-        onLine: line => {
-            if (line.endsWith('\\')) {
-                chunk += line.replace(/\\$/, '').replace(/""/g, '\\"')
-            } else {
-                chunk += line
-                cb(ericParse(chunk))
-                chunk = ''
-            }
-        },
-    })
-}
-
-// mutates arg
-function followTransitiveDefsDepth1(refsByDef: Map<string, Set<string>>): void {
-    for (const [def, refs] of Array.from(refsByDef.entries())) {
-        for (const ref of Array.from(refs)) {
-            const transitiveRefs: Set<string> | undefined = refsByDef.get(ref)
-            if (!transitiveRefs) {
-                continue
-            }
-            transitiveRefs.forEach(tref => refs.add(tref))
-            if (!Array.from(transitiveRefs).some(tref => tref === ref)) {
-                refsByDef.delete(ref)
-            }
-        }
-    }
-}
-
-// Cross-file j2d through a header file looks like this:
-//
-// ref,defloc,"five.h:2:4",deflocend,"five.h:2:8",loc,"main.cpp:13:2",locend,"main.cpp:13:6",kind,"function",name,"five",qualname,"five(int)"
-// decldef,name,"five",qualname,"five(int)",loc,"five.h:2:4",locend,"five.h:2:8",defloc,"five.cpp:3:4",kind,"function"
-//
-// Trimming that down to what's relevant:
-//
-// ref,defloc,"five.h:2:4",loc,"main.cpp:13:2"
-// decldef,loc,"five.h:2:4",defloc,"five.cpp:3:4"
-//
-// So there's a foreign key constraint between ref.defloc and decldef.loc
-
-function mkDispatch({
-    link,
-    recordMoniker,
-}: {
-    link: Link
-    recordMoniker: RecordMoniker
-}): (entry: GenericEntry) => void {
-    const dispatchByKind: Record<
-        'ref' | 'decldef',
-        (entry: GenericEntry) => void
-    > = {
-        ref: entry => {
-            const location = parseLocation(entry.value.loc, entry.value.locend)
-            if (!entry.value.defloc) {
-                link({
-                    def: location,
-                    ref: location,
-                })
-                recordMoniker({
-                    moniker: entry.value.qualname,
-                    range: stringifyLocation(location),
-                    kind: MonikerKind.import,
-                    packageInformation: 'lol',
-                })
-                return
-            }
-            link({
-                def: parseLocation(entry.value.defloc, entry.value.defloc),
-                ref: location,
-            })
-        },
-        decldef: entry => {
-            const location = parseLocation(entry.value.loc, entry.value.locend)
-            if (!entry.value.defloc) {
-                recordMoniker({
-                    moniker: entry.value.qualname,
-                    range: stringifyLocation(location),
-                    kind: MonikerKind.import,
-                    packageInformation: 'lol',
-                })
-                return
-            }
-            const defLocation = parseLocation(entry.value.defloc, entry.value.deflocend)
-            recordMoniker({
-                moniker: entry.value.qualname,
-                range: stringifyLocation(defLocation),
-                kind: MonikerKind.export,
-                packageInformation: 'lol',
-            })
-            link({
-                def: defLocation,
-                ref: location,
-            })
-        },
-    }
-
-    return entry => {
-        const dispatch: ((entry: GenericEntry) => void) | undefined =
-            dispatchByKind[entry.kind]
-        if (!dispatch) {
-            // console.log('skipping', line)
-            return
-        }
-        dispatch(entry)
-        // TODO handle nuances with merging `decldef`s and composing refs
-        // console.log(util.inspect(entry, { depth: 5, colors: true }))
-    }
-}
-
 function makeRange(loc: lsp.Location): Range {
     return {
         id: stringifyLocation(loc),
@@ -350,14 +388,16 @@ function makeRange(loc: lsp.Location): Range {
     }
 }
 
-async function emitDefsRefs({
+async function emitDefsRefsHovers({
     refsByDef,
+    hoverByDef,
     locByRange,
     emit,
     importMonikerByRange,
     exportMonikerByRange,
 }: {
     refsByDef: Map<string, Set<string>>
+    hoverByDef: Map<string, string>
     locByRange: Map<string, lsp.Location>
     emit: Emit
     importMonikerByRange: Map<
@@ -386,10 +426,12 @@ async function emitDefsRefs({
         //                                          \ |  ------------------------------------------------------------------
         //                                           \|/                                                                    \
         // ($def) ---2*next:$def---> 1*(resultSet:$def) ---7*textDocument/references:$def---> 6*(reference:$def) -------     \
-        //  | |                                        \---4*textDocument/definition:$def---> 3*(definition:$def)   \    \    |
-        //   \ \                                                                             /                       |    |   |
-        //    \  ---<---5*item:textDocument/definition:$def---------------------------------                        /     |   |
-        //      ----<---8*item:textDocument/references:definitions:$def--------------------------------------------      /    |
+        //  ^                                          \---4*textDocument/definition:$def---> 3*(definition:$def)   \    \    |
+        //  |                                          \---?*textDocument/hover:$def---> ?*(hover:$def)         |    |    |   |
+        //  |                                                                                /                 /     |    |   |
+        //  |-------<---?*item:textDocument/hover:$def--------------------------------------                 /       |    |   |
+        //  |-------<---5*item:textDocument/definition:$def-------------------------------------------------        /     |   |
+        //  +-------<---8*item:textDocument/references:definitions:$def--------------------------------------------      /    |
         //          ----------------<---10*item:textDocument/references:references:$def:$*uri---------------------------     /
         //        /-------/-------------------9*next:$*ref--->--------------------------------------------------------------
         //       /       /
@@ -472,6 +514,26 @@ async function emitDefsRefs({
                 outV: 'definition:' + def,
                 inVs: [def],
                 document: 'document:' + defLoc.uri,
+            })
+        }
+
+        const hover = hoverByDef.get(def)
+        if (hover) {
+            // ?
+            await emit<HoverResult>({
+                id: 'hover:' + def,
+                label: VertexLabels.hoverResult,
+                type: ElementTypes.vertex,
+                result: { contents: hover },
+            })
+
+            // ?
+            await emit<textDocument_hover>({
+                id: 'textDocument/hover:' + def,
+                type: ElementTypes.edge,
+                label: EdgeLabels.textDocument_hover,
+                outV: 'resultSet:' + def,
+                inV: 'hover:' + def,
             })
         }
 
@@ -587,7 +649,9 @@ async function emitDocsEnd({
         const ranges = rangesByDoc.get(doc)
         if (ranges === undefined) {
             throw new Error(
-                `rangesByDoc didn't contain doc ${doc}, but contained ${rangesByDoc.keys()}`
+                `rangesByDoc didn't contain doc ${doc}, but contained ${Array.from(
+                    rangesByDoc.keys()
+                )}`
             )
         }
 
@@ -614,14 +678,18 @@ async function emitDocsBegin({
     root,
     doc,
     emit,
+    includeContents = false,
 }: {
     root: string
     doc: string
     emit: Emit
+    includeContents?: boolean
 }): Promise<void> {
     let contents = ''
     try {
-        contents = fs.readFileSync(path.join(root, doc)).toString('base64')
+        if (includeContents) {
+            contents = fs.readFileSync(path.join(root, doc)).toString('base64')
+        }
     } catch (e) {
         // ignore
     }
@@ -674,7 +742,7 @@ function makeProject(): Project {
     }
 }
 
-function makeMeta(root: string, csvFileGlob: string): MetaData {
+function makeMeta(root: string, inFileGlob: string): MetaData {
     return {
         id: 'meta',
         type: ElementTypes.vertex,
@@ -684,42 +752,10 @@ function makeMeta(root: string, csvFileGlob: string): MetaData {
         positionEncoding: 'utf-16',
         toolInfo: {
             name: 'lsif-cpp',
-            args: [csvFileGlob, root],
+            args: [inFileGlob, root],
             version: 'dev',
         },
     }
-}
-
-function forEachLine({
-    filePath,
-    onLine,
-}: {
-    filePath: string
-    onLine: (line: string) => void
-}): Promise<void> {
-    return new Promise((resolve, reject) => {
-        let lineNumber = 0
-        const rl = readline.createInterface({
-            input: fs.createReadStream(filePath),
-        })
-        rl.on('line', line => {
-            try {
-                onLine(line)
-            } catch (e) {
-                reject(
-                    new VError(
-                        {
-                            cause: e,
-                            info: { lineNumber, filePath },
-                        },
-                        'error'
-                    )
-                )
-            }
-            lineNumber++
-        })
-        rl.on('close', resolve)
-    })
 }
 
 function parseLocation(start: string, end: string): lsp.Location {
@@ -746,135 +782,11 @@ function parseFilePosition(value: string): FilePosition {
             `expected path of the form path/to/file.cpp:<line>:<column>, got ${value}`
         )
     }
-    // Oddly enough, line is base 1 but column is base 0.
-    // https://github.com/mozilla/dxr/blob/a4a20cc4a9991a3efbc13cb5fe036f3608368e6c/dxr/plugins/clang/dxr-index.cpp#L285-L287
-    const lineBase1 = parseInt(components[components.length - 2], 10)
-    const characterBase0 = parseInt(components[components.length - 1], 10)
+    const line = parseInt(components[components.length - 2], 10)
+    const character = parseInt(components[components.length - 1], 10)
     const path = components.slice(0, components.length - 2).join('')
     return {
         uri: path,
-        position: { line: lineBase1 - 1, character: characterBase0 },
-    }
-}
-
-// Reimplementation of ericParse with nice error messages, but 5x slower.
-function parsimmonParse(line: string): GenericEntry {
-    const wordP = P.regexp(/[a-zA-Z_]+/)
-    const kindP = wordP
-    const keyP = wordP
-    const valueP = P.regexp(/"((?:\\.|.)*?)"/, 1).map(value =>
-        value.replace('\\', '')
-    )
-    const commaP = P.string(',')
-    const kvP = P.seq(keyP.skip(commaP), valueP)
-    const lineP = P.seq(kindP.skip(commaP), P.sepBy(kvP, commaP)).map(
-        ([kind, kvs]) => ({ kind, value: fromPairs(kvs) })
-    )
-
-    return lineP.tryParse(line)
-}
-
-function ericParse(line: string): GenericEntry {
-    function fields(line: string): string[] {
-        let i = 0
-        const fields: any[] = []
-
-        const eatWhitespace = () => {
-            while (i < line.length && line[i] == ' ') {
-                i++
-            }
-        }
-
-        const eatSeparator = () => {
-            if (i < line.length && line[i] == ',') {
-                i++
-                return
-            }
-
-            throw new Error(`expected comma`)
-        }
-
-        const parseIdent = () => {
-            const start = i
-            i++
-            while (i < line.length && isIdent(line[i])) {
-                i++
-            }
-
-            fields.push(line.substring(start, i))
-        }
-
-        const parseString = () => {
-            i++
-            const start = i
-
-            while (i < line.length) {
-                if (line[i] == '"') {
-                    fields.push(line.substring(start, i))
-                    i++
-                    return
-                }
-
-                if (line[i] == '\\') {
-                    if (i + 1 >= line.length) {
-                        throw new Error(`unterminated escape sequence`)
-                    }
-
-                    i++
-                }
-
-                i++
-            }
-
-            throw new Error(`unterminated string`)
-        }
-
-        while (i < line.length) {
-            eatWhitespace()
-
-            if (i > 0) {
-                eatSeparator()
-                eatWhitespace()
-            }
-
-            if (isIdent(line[i])) {
-                parseIdent()
-            } else if (line[i] == '"') {
-                parseString()
-            } else {
-                console.log(fields)
-                throw new Error(`unknown start of token ${line[i]}`)
-            }
-
-            eatWhitespace()
-        }
-
-        return fields
-    }
-
-    function isIdent(char: string): boolean {
-        if (char === '_') {
-            return true
-        }
-
-        if ('a' <= char && char <= 'z') {
-            return true
-        }
-
-        if ('A' <= char && char <= 'Z') {
-            return true
-        }
-
-        return false
-    }
-
-    const parts = fields(line)
-    if (parts.length === 0) {
-        throw new Error('expected at least one field')
-    }
-
-    return {
-        kind: parts[0],
-        value: fromPairs(chunk(parts.slice(1), 2)),
+        position: { line, character },
     }
 }

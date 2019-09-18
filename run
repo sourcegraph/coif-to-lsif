@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 
-set -ex
+set -e
 
+CWD="$(pwd)"
+SRC="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd $SRC
 ./build
-
-node out/main.js "$@"
+cd "$CWD"
+node "$SRC/out/main.js" "$@"
