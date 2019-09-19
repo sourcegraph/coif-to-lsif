@@ -1,0 +1,5 @@
+{"start":{"line":28,"col":15},"end":{"line":28,"col":24},"type":"(module Patdiff_lib.Is_binary)"}
+{"start":{"line":28,"col":15},"end":{"line":28,"col":31},"definition":{"file":"is_binary.mli","pos":{"line":1,"col":0}}}
+{"start":{"line":28,"col":15},"end":{"line":28,"col":31},"definition":{"file":"is_binary.mli","pos":{"line":6,"col":0}}}
+{"start":{"line":28,"col":15},"end":{"line":28,"col":31},"type":"string -> bool"}
+{"start":{"line":28,"col":15},"end":{"line":28,"col":69},"type":"bool * bool"}

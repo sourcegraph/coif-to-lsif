@@ -51,40 +51,9 @@ import {
 import * as lsp from 'vscode-languageserver-protocol'
 import * as P from 'parsimmon'
 import glob from 'glob'
-import Database from 'better-sqlite3'
-
-// What are all of the kinds? According to DXR source code:
-//
-// rg "^\s*beginRecord" dxr/plugins/clang/dxr-index.cpp | gsed "s/^ *beginRecord..\(\w\+\).*/\1/" | sort
-//
-// call call decldef func_override function impl include macro namespace namespace_alias ref ref type typedef typedef variable warning
-//
-// TODO exhaustiveness check: make sure all kinds and fields are used (or at least acknowledged) by this converter.
+import sqlite from 'better-sqlite3'
 
 type Emit = <T extends Edge | Vertex>(item: T) => Promise<void>
-
-// {
-//   "start": {
-//     "line": 99,
-//     "col": 62
-//   },
-//   "end": {
-//     "line": 99,
-//     "col": 68
-//   },
-//   "definition": {
-//     "file": "*buffer*",
-//     "pos": {
-//       "line": 57,
-//       "col": 4
-//     }
-//   },
-//   "type": "[< `Path of string | `String of string ]"
-// }
-//
-// file,start,end,deffile,defstart,type?
-// docs = SELECT DISTINCT file
-// rangesByDoc = SELECT start,end GROUP BY file
 
 type Doc_ = string
 type Range_ = string
@@ -92,13 +61,15 @@ type Ref_ = Range_
 type Def_ = Range_
 
 export async function writeLSIF({
-    inFileGlob,
+    inFile,
     root,
     emit,
+    log = console.log,
 }: {
-    inFileGlob: string
+    inFile: string
     root: string
     emit: Emit
+    log?: (...args: any[]) => void
 }): Promise<void> {
     const docs = new Set<Doc_>()
     const rangesByDoc = new Map<Doc_, Set<Range_>>()
@@ -114,144 +85,170 @@ export async function writeLSIF({
         { moniker: string; packageInformation: string }
     >()
 
-    const inFiles = glob.sync(inFileGlob)
-    if (inFiles.length === 0) {
-        throw new Error(`glob ${inFileGlob} did not match any files`)
-    }
-
     try {
-        fs.unlinkSync('data.sqlite')
+        // Remove old database file, if it exists
+        fs.unlinkSync('scratch.db')
     } catch (e) {
-        // yolo
+        if (!(e && e.code === 'ENOENT')) {
+            throw e
+        }
     }
-    const db = new Database('data.sqlite')
-    db.exec(`DROP TABLE IF EXISTS lines`)
-    db.exec(`CREATE TABLE lines (
-            file TEXT NOT NULL,
-            start TEXT NOT NULL,
-            end TEXT NOT NULL,
+
+    const db = sqlite('scratch.db')
+    db.pragma('foreign_keys = ON')
+    db.pragma('synchronous = OFF')
+    db.exec(`CREATE TABLE symbols (
+            id INTEGER PRIMARY KEY,
             deffile TEXT NOT NULL,
-            defstart TEXT NOT NULL,
-            type TEXT NOT NULL,
-            UNIQUE (file, start, end)
+            defline INTEGER NOT NULL,
+            defstartcol INTEGER NOT NULL,
+            defendcol INTEGER NOT NULL,
+            hover TEXT,
+            UNIQUE (deffile, defline, defstartcol, defendcol)
         )`)
+    db.exec(`CREATE TABLE refs (
+            reffile TEXT NOT NULL,
+            refline INTEGER NOT NULL,
+            refstartcol INTEGER NOT NULL,
+            refendcol INTEGER NOT NULL,
+            sid INTEGER NOT NULL,
+            UNIQUE (reffile, refline, refstartcol, refendcol)
+        )`)
+    db.exec('CREATE INDEX ix_line ON refs(refline)')
 
-    for (const inFile of inFiles) {
-        const insert = db.prepare(
-            'INSERT OR REPLACE INTO lines (file, start, end, deffile, defstart, type) VALUES (@file, @start, @end, @deffile, @defstart, @type)'
-        )
+    const symbol = db.prepare(
+        'INSERT INTO symbols (id, deffile, defline, defstartcol, defendcol, hover) VALUES (@id, @deffile, @defline, @defstartcol, @defendcol, @hover)'
+    )
+    const filerefs = db.prepare(
+        'INSERT INTO refs (reffile, refline, refstartcol, refendcol, sid) VALUES (@reffile, @refline, @refstartcol, @refendcol, @sid)'
+    )
 
-        const insertMany = db.transaction(lines => {
-            for (const line of lines) insert.run(line)
-        })
+    log('Loading out.jsonl...')
+    db.transaction(() => {
+        let id = 0
+        for (const line of fs
+            .readFileSync(inFile)
+            .toString()
+            .split('\n')) {
+            if (id % 1000 === 0) {
+                log(id + ' ids loaded so far...')
+            }
+            if (line === '') {
+                continue
+            }
 
-        const sourceFile = inFile
-            .slice(root.length + 1 /* for the slash */)
-            .replace(/.lsif.in$/, '')
-
-        insertMany(
-            fs
-                .readFileSync(inFile)
-                .toString()
-                .trimRight()
-                .split('\n')
-                .map(line => JSON.parse(line))
-                .filter(line => 'start' in line)
-                .map(line => {
-                    try {
-                        line.start.line = line.start.line - 1
-                        line.end.line = line.end.line - 1
-                        line.definition.pos.line = line.definition.pos.line - 1
-                        line.definition.file =
-                            line.definition.file === '*buffer*'
-                                ? sourceFile
-                                : line.definition.file
-                        return line
-                    } catch (e) {
-                        console.log('Error on line', line)
-                        throw e
-                    }
+            const lineobj:
+                | {
+                      symbol: {
+                          file: string
+                          range: string
+                          hover?: string
+                      }
+                  }
+                | {
+                      references: { file: string; ranges: string[] }
+                  } = JSON.parse(line)
+            if ('symbol' in lineobj) {
+                id++
+                const { file, range, hover } = lineobj.symbol
+                symbol.run({
+                    id,
+                    deffile: file,
+                    defline: range.split(':')[0],
+                    defstartcol: range.split(':')[1].split('-')[0],
+                    defendcol: range.split(':')[1].split('-')[1],
+                    hover: hover,
                 })
-                .filter(line => !line.definition.file.startsWith('/'))
-                .map(line => ({
-                    file: sourceFile,
-                    start: stringifyPosition(line.start),
-                    end: stringifyPosition(line.end),
-                    deffile: line.definition.file,
-                    defstart: stringifyPosition(line.definition.pos),
-                    type: (line.type || '<unknown>').slice(0, 200),
-                }))
-        )
-    }
+            } else {
+                const { file, ranges } = lineobj.references
+                for (const range of ranges) {
+                    filerefs.run({
+                        reffile: file,
+                        refline: range.split(':')[0],
+                        refstartcol: range.split(':')[1].split('-')[0],
+                        refendcol: range.split(':')[1].split('-')[1],
+                        sid: id,
+                    })
+                }
+            }
+        }
+    })()
 
-    // db.exec(`DROP TABLE IF EXISTS lines`)
-
-    // db.exec(`CREATE TABLE symbols (
-    //     deffile TEXT NOT NULL,
-    //     defstart TEXT NOT NULL,
-    //     type TEXT NOT NULL
-    // )`)
-    // db.exec(
-    //     'INSERT INTO symbols (deffile, defstart, type) SELECT deffile, defstart, type FROM lines'
-    // )
-
-    // db.exec(`
-    //     BEGIN TRANSACTION;
-    //     CREATE TEMPORARY TABLE t1_backup(a,b);
-    //     INSERT INTO t1_backup SELECT a,b FROM t1;
-    //     DROP TABLE t1;
-    //     CREATE TABLE t1(a,b);
-    //     INSERT INTO t1 SELECT a,b FROM t1_backup;
-    //     DROP TABLE t1_backup;
-    //     COMMIT;
-    // `)
-
-    for (const hmm of db
+    log('Collecting ranges...')
+    const results: {
+        file: string
+        line: number
+        startcol: number
+        endcol: number
+    }[] = db
         .prepare(
-            'SELECT DISTINCT file, start, end from lines UNION ALL SELECT DISTINCT deffile, defstart, defstart from lines'
+            `
+            SELECT DISTINCT deffile file, defline line, defstartcol startcol, defendcol endcol FROM symbols
+            UNION ALL
+            SELECT DISTINCT reffile file, refline line, refstartcol startcol, refendcol endcol FROM refs
+        `
         )
-        .all()) {
-        docs.add(hmm.file)
-        rangesByDoc.set(hmm.file, rangesByDoc.get(hmm.file) || new Set())
-        const ranges = rangesByDoc.get(hmm.file)!
-        const start = stringifyStringLocation({
-            uri: hmm.file,
-            range: { start: hmm.start },
-        })
+        .all()
+    for (const result of results) {
+        docs.add(result.file)
+        rangesByDoc.set(result.file, rangesByDoc.get(result.file) || new Set())
+        const ranges = rangesByDoc.get(result.file)!
+        const loc: lsp.Location = {
+            uri: result.file,
+            range: {
+                start: { line: result.line, character: result.startcol },
+                end: {
+                    line: result.line /* all ranges are single-line */,
+                    character: result.endcol,
+                },
+            },
+        }
+        const start = stringifyLocation(loc)
         ranges.add(start)
-        locByRange.set(
-            start,
-            parseLocation(`${hmm.file}:${hmm.start}`, `${hmm.file}:${hmm.end}`)
-        )
+        locByRange.set(start, loc)
     }
 
-    for (const hmm of db
+    log('Linking defs and refs...')
+    for (const result of db
         .prepare(
-            'SELECT DISTINCT file, start, deffile, defstart, type from lines'
+            `
+            SELECT deffile, defline, defstartcol, defendcol, reffile, refline, refstartcol, refendcol, hover
+            FROM refs JOIN symbols on refs.sid = symbols.id
+            `
         )
         .all()) {
-        const therefstart = stringifyStringLocation({
-            uri: hmm.file,
-            range: { start: hmm.start },
+        const refstart = stringifyLocation({
+            uri: result.reffile,
+            range: {
+                start: { line: result.refline, character: result.refstartcol },
+                end: {
+                    line: result.refline /* all ranges are single-line */,
+                    character: result.refendcol,
+                },
+            },
         })
-        const thedefstart = stringifyStringLocation({
-            uri: hmm.deffile,
-            range: { start: hmm.defstart },
+        const defstart = stringifyLocation({
+            uri: result.deffile,
+            range: {
+                start: { line: result.defline, character: result.defstartcol },
+                end: {
+                    line: result.defline /* all ranges are single-line */,
+                    character: result.defendcol,
+                },
+            },
         })
-        refsByDef.set(thedefstart, refsByDef.get(thedefstart) || new Set())
-        const refs = refsByDef.get(thedefstart)!
-        refs.add(therefstart)
+        refsByDef.set(defstart, refsByDef.get(defstart) || new Set())
+        const refs = refsByDef.get(defstart)!
+        refs.add(refstart)
 
-        hoverByDef.set(thedefstart, hmm.type)
+        hoverByDef.set(defstart, result.hover)
     }
 
-    // refsByDef def keys ranges
-    // locByRange
-
-    await ffff({
+    log('Emitting...')
+    await collectAndEmit({
         emit,
         root,
-        inFileGlob,
+        inFile,
         docs,
         rangesByDoc,
         refsByDef,
@@ -262,10 +259,11 @@ export async function writeLSIF({
     })
 }
 
-async function ffff({
+// TODO share this with lsif-cpp
+async function collectAndEmit({
     emit,
     root,
-    inFileGlob,
+    inFile,
     docs,
     rangesByDoc,
     refsByDef,
@@ -276,7 +274,7 @@ async function ffff({
 }: {
     emit: Emit
     root: string
-    inFileGlob: string
+    inFile: string
 
     docs: Set<Doc_>
     rangesByDoc: Map<Doc_, Set<Range_>>
@@ -292,7 +290,7 @@ async function ffff({
         { moniker: string; packageInformation: string }
     >
 }): Promise<void> {
-    await emit(makeMeta(root, inFileGlob))
+    await emit(makeMeta(root, inFile))
     await emit(makeProject())
     await emit(makeProjectBegin())
 
@@ -338,13 +336,6 @@ function stringifyLocation(loc: lsp.Location): string {
     return `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}`
 }
 
-function stringifyStringLocation(loc: {
-    uri: string
-    range: { start: string }
-}): string {
-    return `${loc.uri}:${loc.range.start}`
-}
-
 interface Pos_ {
     line: number
     col: number
@@ -355,22 +346,10 @@ interface ImportRange {
     end: Pos_
 }
 
-function stringifyRange(range: ImportRange): string {
-    return `${range.start.line}:${range.start.col}-${range.end.line}:${range.end.col}`
-}
-
-function stringifyPosition(pos: Pos_): string {
-    return `${pos.line}:${pos.col}`
-}
-
 interface FilePosition {
     uri: string
     position: lsp.Position
 }
-
-type GenericEntry = { kind: string; value: Dictionary<string> }
-
-type Link = (info: { def: lsp.Location; ref: lsp.Location }) => void
 
 type RecordMoniker = (arg: {
     moniker: string
@@ -412,7 +391,9 @@ async function emitDefsRefsHovers({
     for (const [def, refs] of Array.from(refsByDef.entries())) {
         const defLoc = locByRange.get(def)
         if (!defLoc) {
-            throw new Error('Unable to look up def')
+            throw new Error(
+                `Unable to look up def ${def} in ${util.inspect(locByRange)}`
+            )
         }
 
         //  ---14*packageEdge:$package---> (13*packageEdge:$package)
@@ -754,23 +735,6 @@ function makeMeta(root: string, inFileGlob: string): MetaData {
             name: 'lsif-cpp',
             args: [inFileGlob, root],
             version: 'dev',
-        },
-    }
-}
-
-function parseLocation(start: string, end: string): lsp.Location {
-    const startP = parseFilePosition(start)
-    const endP = parseFilePosition(end)
-    if (startP.uri !== endP.uri) {
-        throw new Error(
-            `expected start and end of range to be in the same file, but were ${start} and ${end}`
-        )
-    }
-    return {
-        uri: startP.uri,
-        range: {
-            start: startP.position,
-            end: endP.position,
         },
     }
 }

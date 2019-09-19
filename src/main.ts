@@ -14,11 +14,11 @@ process.on('uncaughtException', error => {
 main()
 
 async function main() {
-    const { inFileGlob, root, out } = yargs
-        .demandOption('inFileGlob')
+    const { inFile, root, out } = yargs
+        .demandOption('inFile')
         .demandOption('out')
         .demandOption('root').argv as {
-        inFileGlob: string
+        inFile: string
         root: string
         out: string
     }
@@ -31,7 +31,7 @@ async function main() {
 
     try {
         await writeLSIF({
-            inFileGlob,
+            inFile,
             root,
             emit: item =>
                 new Promise(resolve => {

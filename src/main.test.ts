@@ -6,10 +6,9 @@ async function indexExample(example: string): Promise<(Edge | Vertex)[]> {
     const output: (Edge | Vertex)[] = []
 
     await writeLSIF({
-        inFileGlob: `examples/${example}/*.lsif.in`,
+        inFile: `examples/${example}/out.jsonl`,
         root: `examples/${example}`,
-        // inFileGlob: `/Users/chrismwendt/github.com/comby-tools/comby/**/*.lsif.in`,
-        // root: `/Users/chrismwendt/github.com/comby-tools/comby`,
+        // log: () => {},
         emit: item =>
             new Promise(resolve => {
                 output.push(item)
@@ -49,3 +48,8 @@ test.only('one', async () => {
     const output = (await indexExample('one')).map(v => JSON.stringify(v))
     expect(output.join('\n')).toMatchSnapshot()
 })
+
+// test.only('two', async () => {
+//     const output = (await indexExample('two')).map(v => JSON.stringify(v))
+//     expect(output.join('\n')).toMatchSnapshot()
+// })
