@@ -191,7 +191,7 @@ export async function writeLSIF({
         .all()
     for (const result of results) {
         docs.add(result.file)
-        rangesByDoc.set(result.file, rangesByDoc.get(result.file) || new Set())
+        rangesByDoc.set(result.file, rangesByDoc.get(result.file) ?? new Set())
         const ranges = rangesByDoc.get(result.file)!
         const loc: lsp.Location = {
             uri: result.file,
@@ -237,7 +237,7 @@ export async function writeLSIF({
                 },
             },
         })
-        refsByDef.set(defstart, refsByDef.get(defstart) || new Set())
+        refsByDef.set(defstart, refsByDef.get(defstart) ?? new Set())
         const refs = refsByDef.get(defstart)!
         refs.add(refstart)
 
