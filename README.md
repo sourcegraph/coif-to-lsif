@@ -1,5 +1,11 @@
 # CoIF -> LSIF
 
+CoIF is not actively developed; you probably want to look at [SCIP](https://sourcegraph.com/github.com/sourcegraph/scip) instead.
+
+The information below is preserved for archival purposes.
+
+---
+
 This converts CoIF to LSIF.
 
 # CoIF
